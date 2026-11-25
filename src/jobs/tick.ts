@@ -1,5 +1,7 @@
-import { TelegramClient } from "../telegram/client";
 import { TelegramApiError } from "../telegram/errors";
+import type { TelegramMessage } from "../telegram/types";
+import { createAccountClient, type AccountClient } from "../telegram/account";
+import { parseUpdateState, serializeUpdateState } from "../mtproto/session";
 import {
   advanceTaskProgress,
   appendActivityLog,
@@ -18,6 +20,7 @@ import {
   stopTask,
   stopTasksForBot,
   updateBotLastUpdateId,
+  updateUpdateState,
   type BotRow,
 } from "../db/queries";
 import type { TaskSummary } from "../shared/rpcTypes";
@@ -101,124 +104,15 @@ export async function runTick(env: Env): Promise<void> {
     try {
       const bot = await getBotWithSecrets(env.DB, botId);
       if (!bot) return;
-      const client = new TelegramClient(bot.token);
+      const client = createAccountClient(env, bot);
 
       // 1. Pull-based Auto-Sync: Check for new Telegram updates if any task has live_enabled = 1
       const hasLive = groupTasks.some((t) => t.live_enabled);
       if (hasLive) {
-        try {
-          const MAX_PULL_PAGES = 5;
-          let page = 0;
-          let currentOffset = bot.last_update_id > 0 ? bot.last_update_id + 1 : undefined;
-          let maxUpdateId = bot.last_update_id;
-
-          while (page < MAX_PULL_PAGES) {
-            page++;
-            const updates = await client.getUpdates({
-              offset: currentOffset,
-              limit: 100,
-              allowed_updates: ["channel_post"],
-            });
-            if (!updates || updates.length === 0) break;
-
-            for (const update of updates) {
-              if (update.update_id > maxUpdateId) maxUpdateId = update.update_id;
-              const post = update.channel_post;
-              if (!post) continue;
-              const chatStr = String(post.chat.id);
-              const matchingTasks = groupTasks.filter((t) => t.source_chat_id === chatStr && t.live_enabled);
-              if (matchingTasks.length === 0) continue;
-
-              const meta = extractMessageMetadata(post);
-              const icon = getMediaIcon(meta.type);
-              const sizeStr = meta.size ? formatBytes(meta.size) : "";
-              const fileDesc = [icon, sizeStr, meta.name ? `(${meta.name})` : ""].filter(Boolean).join(" ");
-
-              for (const t of matchingTasks) {
-                if (t.cursor === null && t.backfill_status === "not_applicable") {
-                  t.cursor = post.message_id;
-                }
-
-                // Parse filter criteria
-                const filterMediaTypes = t.filter_media_types
-                  ? t.filter_media_types.split(",").map((s) => s.trim()).filter(Boolean)
-                  : undefined;
-                const evalResult = evaluateMessageFilter(post, {
-                  mediaTypes: filterMediaTypes,
-                  minSizeBytes: t.filter_min_size_bytes,
-                  maxSizeBytes: t.filter_max_size_bytes,
-                });
-
-                if (!evalResult.matched) {
-                  // Filtered out / skipped
-                  await incrementLiveCounters(env.DB, t.id, 0, 0, 1);
-                  t.live_skipped = (t.live_skipped ?? 0) + 1;
-                  await appendActivityLog(env.DB, {
-                    task_id: t.id,
-                    kind: "live_forward",
-                    detail: `${fileDesc} · msg #${post.message_id} skipped: ${evalResult.reason}`,
-                    ok: false,
-                    error: `Filtered: ${evalResult.reason}`,
-                  });
-                  continue;
-                }
-
-                // Matched filter! Buffer into task_pending_messages
-                await insertPendingMessage(
-                  env.DB,
-                  t.id,
-                  post.message_id,
-                  meta.type,
-                  meta.size ?? null,
-                  meta.name ?? null,
-                );
-
-                if (t.backfill_status === "running") {
-                  await appendActivityLog(env.DB, {
-                    task_id: t.id,
-                    kind: "live_forward",
-                    detail: `⏳ Queued in buffer: ${fileDesc} · msg #${post.message_id} (waiting for backfill to finish)`,
-                    ok: true,
-                  });
-                }
-              }
-            }
-
-            currentOffset = maxUpdateId + 1;
-            if (updates.length < 100) break;
-          }
-
-          if (maxUpdateId > bot.last_update_id) {
-            await updateBotLastUpdateId(env.DB, bot.id, maxUpdateId);
-            bot.last_update_id = maxUpdateId;
-          }
-        } catch (e) {
-          if (e instanceof TelegramApiError) {
-            if (e.errorCode === 401 || e.reason === "unauthorized") {
-              console.warn(`tick: bot ${bot.bot_username} unauthorized (401), stopping live tasks.`);
-              const stoppedTasks = await stopTasksForBot(env.DB, bot.id, "unauthorized");
-              for (const st of stoppedTasks) {
-                await appendActivityLog(env.DB, {
-                  task_id: st.id,
-                  kind: "live_forward",
-                  detail: "Stopped: Bot token unauthorized (401). Bot token may have been revoked or changed in @BotFather.",
-                  ok: false,
-                  error: "401 Unauthorized",
-                });
-              }
-              return;
-            }
-            if (e.errorCode === 409 || (typeof e.message === "string" && e.message.toLowerCase().includes("webhook"))) {
-              console.warn(`tick: webhook conflict detected for bot ${bot.bot_username}, attempting deleteWebhook to restore getUpdates.`);
-              try {
-                await client.deleteWebhook();
-              } catch (delErr) {
-                console.error(`tick: failed to deleteWebhook for bot ${bot.bot_username}:`, delErr);
-              }
-              return;
-            }
-          }
-          console.error(`tick: getUpdates failed for bot ${bot.bot_username}`, e);
+        if (bot.account_type === "user") {
+          await pollLiveUser(env, bot, client, groupTasks);
+        } else {
+          await pollLiveBot(env, bot, client, groupTasks);
         }
       }
 
@@ -270,6 +164,182 @@ export async function runTick(env: Env): Promise<void> {
   console.log(`tick: ${groups.length} group(s), ${tasks.length} task(s), ${batchesRun} batch(es), mode: ${isSmoothMode ? "smooth" : "round-robin"}, ${wallTimeMs}ms`);
 }
 
+/** Buffers one live source message into every matching live task's pending
+ * queue (after filter evaluation). Shared by the bot (getUpdates) and user
+ * (getHistory watermark) live paths. */
+async function bufferLivePost(env: Env, groupTasks: TaskSummary[], post: TelegramMessage): Promise<void> {
+  const chatStr = String(post.chat.id);
+  const matchingTasks = groupTasks.filter((t) => t.source_chat_id === chatStr && t.live_enabled);
+  if (matchingTasks.length === 0) return;
+
+  const meta = extractMessageMetadata(post);
+  const icon = getMediaIcon(meta.type);
+  const sizeStr = meta.size ? formatBytes(meta.size) : "";
+  const fileDesc = [icon, sizeStr, meta.name ? `(${meta.name})` : ""].filter(Boolean).join(" ");
+
+  for (const t of matchingTasks) {
+    if (t.cursor === null && t.backfill_status === "not_applicable") {
+      t.cursor = post.message_id;
+    }
+
+    const filterMediaTypes = t.filter_media_types
+      ? t.filter_media_types.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined;
+    const evalResult = evaluateMessageFilter(post, {
+      mediaTypes: filterMediaTypes,
+      minSizeBytes: t.filter_min_size_bytes,
+      maxSizeBytes: t.filter_max_size_bytes,
+    });
+
+    if (!evalResult.matched) {
+      await incrementLiveCounters(env.DB, t.id, 0, 0, 1);
+      t.live_skipped = (t.live_skipped ?? 0) + 1;
+      await appendActivityLog(env.DB, {
+        task_id: t.id,
+        kind: "live_forward",
+        detail: `${fileDesc} · msg #${post.message_id} skipped: ${evalResult.reason}`,
+        ok: false,
+        error: `Filtered: ${evalResult.reason}`,
+      });
+      continue;
+    }
+
+    await insertPendingMessage(env.DB, t.id, post.message_id, meta.type, meta.size ?? null, meta.name ?? null);
+
+    if (t.backfill_status === "running") {
+      await appendActivityLog(env.DB, {
+        task_id: t.id,
+        kind: "live_forward",
+        detail: `⏳ Queued in buffer: ${fileDesc} · msg #${post.message_id} (waiting for backfill to finish)`,
+        ok: true,
+      });
+    }
+  }
+}
+
+/** Bot accounts: long-poll getUpdates for channel posts. */
+async function pollLiveBot(env: Env, bot: BotRow, client: AccountClient, groupTasks: TaskSummary[]): Promise<void> {
+  try {
+    const MAX_PULL_PAGES = 5;
+    let page = 0;
+    let currentOffset = bot.last_update_id > 0 ? bot.last_update_id + 1 : undefined;
+    let maxUpdateId = bot.last_update_id;
+
+    while (page < MAX_PULL_PAGES) {
+      page++;
+      const updates = await client.getUpdates({
+        offset: currentOffset,
+        limit: 100,
+        allowed_updates: ["channel_post"],
+      });
+      if (!updates || updates.length === 0) break;
+
+      for (const update of updates) {
+        if (update.update_id > maxUpdateId) maxUpdateId = update.update_id;
+        const post = update.channel_post;
+        if (!post) continue;
+        await bufferLivePost(env, groupTasks, post);
+      }
+
+      currentOffset = maxUpdateId + 1;
+      if (updates.length < 100) break;
+    }
+
+    if (maxUpdateId > bot.last_update_id) {
+      await updateBotLastUpdateId(env.DB, bot.id, maxUpdateId);
+      bot.last_update_id = maxUpdateId;
+    }
+  } catch (e) {
+    if (e instanceof TelegramApiError) {
+      if (e.errorCode === 401 || e.reason === "unauthorized") {
+        console.warn(`tick: bot ${bot.bot_username} unauthorized (401), stopping live tasks.`);
+        const stoppedTasks = await stopTasksForBot(env.DB, bot.id, "unauthorized");
+        for (const st of stoppedTasks) {
+          await appendActivityLog(env.DB, {
+            task_id: st.id,
+            kind: "live_forward",
+            detail: "Stopped: Bot token unauthorized (401). Bot token may have been revoked or changed in @BotFather.",
+            ok: false,
+            error: "401 Unauthorized",
+          });
+        }
+        return;
+      }
+      if (e.errorCode === 409 || (typeof e.message === "string" && e.message.toLowerCase().includes("webhook"))) {
+        console.warn(`tick: webhook conflict detected for bot ${bot.bot_username}, attempting deleteWebhook to restore getUpdates.`);
+        try {
+          await client.deleteWebhook();
+        } catch (delErr) {
+          console.error(`tick: failed to deleteWebhook for bot ${bot.bot_username}:`, delErr);
+        }
+        return;
+      }
+      if (e.reason === "rate_limited") {
+        const waitSeconds = Math.min(
+          Math.max(e.retryAfter ?? 0, RATE_LIMIT_COOLDOWN_MIN_SECONDS),
+          RATE_LIMIT_COOLDOWN_MAX_SECONDS,
+        );
+        await pauseBotForRateLimit(env.DB, bot.id, Math.floor(Date.now() / 1000) + waitSeconds);
+        return;
+      }
+    }
+    console.error(`tick: getUpdates failed for bot ${bot.bot_username}`, e);
+  }
+}
+
+/** User accounts: no getUpdates — poll messages.getHistory per live task with
+ * a per-chat watermark persisted in bots.update_state (so restarts and
+ * isolate moves don't re-copy or miss messages). */
+async function pollLiveUser(env: Env, bot: BotRow, client: AccountClient, groupTasks: TaskSummary[]): Promise<void> {
+  if (!client.pollNewMessages) return;
+  try {
+    const state = parseUpdateState(bot.update_state);
+    let stateChanged = false;
+    for (const t of groupTasks) {
+      if (!t.live_enabled) continue;
+      const watermark = state.chats[t.source_chat_id] ?? 0;
+      const msgs = await client.pollNewMessages(t.source_chat_id, watermark, 100);
+      for (const post of msgs) {
+        if (post.message_id > watermark) {
+          state.chats[t.source_chat_id] = post.message_id;
+          stateChanged = true;
+        }
+        await bufferLivePost(env, groupTasks, post);
+      }
+    }
+    if (stateChanged) {
+      await updateUpdateState(env.DB, bot.id, serializeUpdateState(state));
+      bot.update_state = serializeUpdateState(state);
+    }
+  } catch (e) {
+    if (e instanceof TelegramApiError) {
+      if (e.reason === "unauthorized") {
+        console.warn(`tick: user account ${bot.bot_username} unauthorized — session revoked, stopping live tasks.`);
+        const stoppedTasks = await stopTasksForBot(env.DB, bot.id, "unauthorized");
+        for (const st of stoppedTasks) {
+          await appendActivityLog(env.DB, {
+            task_id: st.id,
+            kind: "live_forward",
+            detail: "Stopped: user session unauthorized (AUTH_KEY_UNREGISTERED / SESSION_REVOKED). Re-login the account to resume.",
+            ok: false,
+            error: e.message,
+          });
+        }
+        return;
+      }
+      if (e.reason === "rate_limited") {
+        const waitSeconds = Math.min(
+          Math.max(e.retryAfter ?? 0, RATE_LIMIT_COOLDOWN_MIN_SECONDS),
+          RATE_LIMIT_COOLDOWN_MAX_SECONDS,
+        );
+        await pauseBotForRateLimit(env.DB, bot.id, Math.floor(Date.now() / 1000) + waitSeconds);
+        return;
+      }
+    }
+    console.error(`tick: live poll failed for user account ${bot.bot_username}`, e);
+  }
+}
+
 /** Drains buffered live messages in chronological order once backfill completes. */
 async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise<boolean> {
   // If backfill is still running, hold the live queue so chronological chat order is preserved
@@ -280,7 +350,7 @@ async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise
 
   const bot = await getBotWithSecrets(env.DB, task.bot_id);
   if (!bot) return false;
-  const client = new TelegramClient(bot.token);
+  const client = createAccountClient(env, bot);
 
   for (const item of pending) {
     const icon = getMediaIcon(item.media_type ?? "text");
@@ -337,11 +407,11 @@ async function drainPendingMessagesForTask(env: Env, task: TaskSummary): Promise
  * every task on it) or the bot just got rate-limited (paused every active
  * task on it) — either way runTick should skip the bot's other tasks for
  * the rest of this run instead of making more doomed Telegram calls. */
-async function processOneBatch(env: Env, task: TaskSummary, botParam?: BotRow, clientParam?: TelegramClient): Promise<boolean> {
+async function processOneBatch(env: Env, task: TaskSummary, botParam?: BotRow, clientParam?: AccountClient): Promise<boolean> {
   if (task.cursor === null || task.end_id === null) return false;
   const bot = botParam ?? (await getBotWithSecrets(env.DB, task.bot_id));
   if (!bot) return false;
-  const client = clientParam ?? new TelegramClient(bot.token);
+  const client = clientParam ?? createAccountClient(env, bot);
 
   const batchStartedAtMs = Date.now();
   const batchEnd = Math.min(task.cursor + task.pacing_batch_size - 1, task.end_id, task.cursor + MAX_BATCH_IDS - 1);

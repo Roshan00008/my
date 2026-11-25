@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "deploy": "vite build && wrangler deploy",
     "typecheck": "tsc -b",
+    "test": "node --experimental-transform-types --import ./tests/register.mjs --test tests/*.test.ts",
     "db:migrate:local": "wrangler d1 migrations apply telegram-clone-worker-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply telegram-clone-worker-db --remote"
   },

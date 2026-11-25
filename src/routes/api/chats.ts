@@ -1,6 +1,7 @@
 import { TelegramClient, type PromoteRights } from "../../telegram/client";
 import { toResult } from "../../telegram/errors";
 import { deriveCapabilities } from "../../telegram/capabilities";
+import { BotAccountClient, createAccountClient, type AccountClient } from "../../telegram/account";
 import { getBotWithSecrets, listTasksForSourceChat } from "../../db/queries";
 import { resolveLastN } from "../../jobs/resolveRange";
 import type { ChatLookupResult } from "../../shared/rpcTypes";
@@ -9,14 +10,15 @@ function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }
 
-/** botId looks up an already-saved bot's token in the DB; token is the raw
- * token for a bot the task wizard hasn't saved yet (see handleVerifyBot) —
- * exactly one of the two is expected to be set. */
-async function loadClient(env: Env, botId: string, token: string): Promise<TelegramClient | null> {
-  if (token) return new TelegramClient(token);
+/** botId looks up an already-saved account's credentials in the DB (bot token
+ * or MTProto user session); token is the raw Bot API token for a bot the task
+ * wizard hasn't saved yet (see handleVerifyBot) — exactly one of the two is
+ * expected to be set. */
+async function loadClient(env: Env, botId: string, token: string): Promise<AccountClient | null> {
+  if (token) return new BotAccountClient(new TelegramClient(token));
   if (!botId) return null;
   const bot = await getBotWithSecrets(env.DB, botId);
-  return bot ? new TelegramClient(bot.token) : null;
+  return bot ? createAccountClient(env, bot) : null;
 }
 
 async function loadClientAndBotId(
@@ -24,21 +26,21 @@ async function loadClientAndBotId(
   botId: string,
   token: string,
   botTelegramId: string,
-): Promise<{ client: TelegramClient; botTelegramId: number } | null> {
+): Promise<{ client: AccountClient; botTelegramId: number; accountType: "bot" | "user" } | null> {
   if (token) {
     const telegramId = Number(botTelegramId);
     if (!telegramId) return null;
-    return { client: new TelegramClient(token), botTelegramId: telegramId };
+    return { client: new BotAccountClient(new TelegramClient(token)), botTelegramId: telegramId, accountType: "bot" };
   }
   if (!botId) return null;
   const bot = await getBotWithSecrets(env.DB, botId);
-  return bot ? { client: new TelegramClient(bot.token), botTelegramId: bot.bot_id } : null;
+  return bot ? { client: createAccountClient(env, bot), botTelegramId: bot.bot_id, accountType: bot.account_type } : null;
 }
 
 export async function handleGetChat(env: Env, chatId: string, botId: string, token: string, botTelegramId: string): Promise<Response> {
   const loaded = await loadClientAndBotId(env, botId, token, botTelegramId);
-  if (!loaded) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
-  const { client, botTelegramId: telegramId } = loaded;
+  if (!loaded) return json({ ok: false, errorCode: 404, description: "account not found", reason: "invalid_request" }, 404);
+  const { client, botTelegramId: telegramId, accountType } = loaded;
 
   const result = await toResult(async (): Promise<ChatLookupResult> => {
     const chat = await client.getChat(chatId);
@@ -68,8 +70,9 @@ export async function handleGetChat(env: Env, chatId: string, botId: string, tok
 
     return {
       chat: { id: chat.id, type: chat.type, title: chat.title, username: chat.username },
+      accountType,
       botStatus: member.status,
-      capabilities: deriveCapabilities(member, chat.type),
+      capabilities: deriveCapabilities(member, chat.type, accountType),
       memberCount,
       admins,
       pastTasks,

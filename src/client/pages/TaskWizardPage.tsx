@@ -391,7 +391,7 @@ export function TaskWizardPage({ fromSavedId }: { fromSavedId?: string }) {
                     <option value="">Choose a previously saved bot…</option>
                     {bots.map((b) => (
                       <option key={b.id} value={b.id}>
-                        {b.label} (@{b.bot_username})
+                        {b.label} (@{b.bot_username}) [{b.account_type === "user" ? "USER" : "BOT"}]
                       </option>
                     ))}
                   </select>

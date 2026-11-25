@@ -34,6 +34,7 @@ import {
   handleGetSavedTask,
   handleListSavedTasks,
 } from "./routes/api/savedTasks";
+import { handleUserLoginStart, handleUserLoginSubmit } from "./routes/api/accounts";
 import { runTick } from "./jobs/tick";
 import { ensureDatabaseBootstrap } from "./db/bootstrap";
 import {
@@ -85,6 +86,12 @@ export default {
       const botId = url.searchParams.get("botId") ?? "";
       const botToken = url.searchParams.get("token") ?? "";
       const botTelegramId = url.searchParams.get("botTelegramId") ?? "";
+
+      // /api/accounts/user/* — user-account (MTProto) login flow
+      if (parts[1] === "accounts" && parts[2] === "user" && parts.length === 4) {
+        if (parts[3] === "start" && request.method === "POST") return handleUserLoginStart(request, env);
+        if (parts[3] === "submit" && request.method === "POST") return handleUserLoginSubmit(request, env);
+      }
 
       // /api/bots
       if (parts[1] === "bots" && parts.length === 2) {

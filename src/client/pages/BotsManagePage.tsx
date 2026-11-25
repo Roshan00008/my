@@ -4,6 +4,7 @@ import { usePolling } from "../lib/usePolling";
 import { useToast } from "../components/Toast";
 import { PageHero } from "../components/PageHero";
 import { BotActivityModal } from "../components/BotActivityModal";
+import { UserLoginModal } from "../components/UserLoginModal";
 import { navigate } from "../lib/router";
 import type { BotSummary, TaskSummary } from "../../shared/rpcTypes";
 
@@ -13,6 +14,7 @@ export function BotsManagePage() {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [inspectingBot, setInspectingBot] = useState<BotSummary | null>(null);
+  const [addingUser, setAddingUser] = useState(false);
   const toast = useToast();
 
   async function startDelete(bot: BotSummary) {
@@ -52,9 +54,12 @@ export function BotsManagePage() {
   return (
     <div className="content-container">
       <PageHero
-        title="Connected Bots"
-        subtitle="Rename or remove the bots connected to your tasks"
+        title="Connected Accounts"
+        subtitle="Rename or remove the bots and user accounts connected to your tasks"
       >
+        <button className="btn btn-secondary" onClick={() => setAddingUser(true)}>
+          + Add User Account
+        </button>
         <button className="btn btn-primary" onClick={() => navigate("wizard")}>
           + Connect Bot
         </button>
@@ -90,7 +95,20 @@ export function BotsManagePage() {
               ) : (
                 <>
                   <span>
-                    {bot.label} <span className="text-muted">@{bot.bot_username}</span>
+                    {bot.label} <span className="text-muted">@{bot.bot_username}</span>{" "}
+                    <span
+                      style={{
+                        background: bot.account_type === "user" ? "#7c5cff" : "var(--accent)",
+                        color: "#fff",
+                        fontSize: 10,
+                        fontWeight: 600,
+                        padding: "1px 6px",
+                        borderRadius: 4,
+                        verticalAlign: "middle",
+                      }}
+                    >
+                      {bot.account_type === "user" ? "USER" : "BOT"}
+                    </span>
                   </span>
                   <div className="row" style={{ gap: 6 }}>
                     <button
@@ -111,7 +129,13 @@ export function BotsManagePage() {
               )}
             </div>
             <div className="task-detail">
-              <span>Bot ID: {bot.bot_id}</span>
+              <span>{bot.account_type === "user" ? "User ID" : "Bot ID"}: {bot.bot_id}</span>
+              {bot.phone && (
+                <>
+                  <span>·</span>
+                  <span>Phone: {bot.phone}</span>
+                </>
+              )}
               <span>·</span>
               <span>Added: {new Date(bot.created_at * 1000).toLocaleDateString()}</span>
             </div>
@@ -146,6 +170,16 @@ export function BotsManagePage() {
           botUsername={inspectingBot.bot_username}
           onClose={() => setInspectingBot(null)}
           onWebhookDisconnected={() => refetch()}
+        />
+      )}
+
+      {addingUser && (
+        <UserLoginModal
+          onClose={() => setAddingUser(false)}
+          onLoggedIn={() => {
+            setAddingUser(false);
+            refetch();
+          }}
         />
       )}
     </div>

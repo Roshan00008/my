@@ -1,7 +1,7 @@
-import { TelegramClient } from "../../telegram/client";
 import { toResult } from "../../telegram/errors";
 import { resolveLastN } from "../../jobs/resolveRange";
 import { createBotRecord } from "./bots";
+import { createAccountClient } from "../../telegram/account";
 import {
   findDuplicateTask,
   getBotWithSecrets,
@@ -84,6 +84,16 @@ interface CreateTaskBody {
  * real per-bot throughput instead of pre-guessing conservatively by type. */
 const DEFAULT_PACING_BATCH_SIZE = 60;
 
+/** User accounts don't get Telegram's documented bot rate limits, but they
+ * are governed by undocumented behavioral flood control (FLOOD_WAIT_x /
+ * PEER_FLOOD, and account-ban risk on sustained abuse), so they pace more
+ * conservatively than bots. */
+const DEFAULT_PACING_BATCH_SIZE_USER = 20;
+
+function defaultPacingFor(accountType: "bot" | "user"): number {
+  return accountType === "user" ? DEFAULT_PACING_BATCH_SIZE_USER : DEFAULT_PACING_BATCH_SIZE;
+}
+
 export async function handleCreateTask(request: Request, env: Env, botId: string, origin: string): Promise<Response> {
   const body = (await request.json()) as CreateTaskBody;
 
@@ -111,7 +121,7 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
   const wantsBackfill = body.scope === "live_and_backfill" || body.scope === "backfill_only";
   const wantsLive = body.scope === "live" || body.scope === "live_and_backfill";
 
-  const client = new TelegramClient(bot.token);
+  const client = createAccountClient(env, bot);
 
   const result = await toResult(async () => {
     let startId = body.startId ?? null;
@@ -126,7 +136,7 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
     const id = crypto.randomUUID();
     const label =
       body.label ?? `${body.sourceChatTitle ?? body.sourceChatId} → ${body.destChatTitle ?? body.destChatId}`;
-    const pacingBatchSize = body.pacingBatchSize ?? DEFAULT_PACING_BATCH_SIZE;
+    const pacingBatchSize = body.pacingBatchSize ?? defaultPacingFor(bot.account_type);
 
     await insertTask(env.DB, {
       id,
@@ -157,6 +167,7 @@ export async function handleCreateTask(request: Request, env: Env, botId: string
         await insertSavedTask(env.DB, {
           id: crypto.randomUUID(),
           task_id: id,
+          account_id: bot.id,
           bot_token: bot.token,
           bot_label: bot.label,
           bot_username: bot.bot_username,
@@ -302,7 +313,7 @@ export async function handleTestCopy(env: Env, botId: string, taskId: string, me
   const task = await getTask(env.DB, taskId);
   if (!bot || !task) return json({ ok: false, errorCode: 404, description: "not found", reason: "invalid_request" }, 404);
 
-  const client = new TelegramClient(bot.token);
+  const client = createAccountClient(env, bot);
   const result = await toResult(async () => {
     let copyId = messageId;
     if (!copyId) {

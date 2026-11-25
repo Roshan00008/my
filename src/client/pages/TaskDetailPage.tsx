@@ -393,8 +393,22 @@ export function TaskDetailPage({ taskId }: { taskId: string }) {
         </div>
         <div className="task-spec-grid">
           <div className="task-spec-item">
-            <div className="task-spec-label">Connected Bot</div>
-            <div className="task-spec-value">@{task.bot_username}</div>
+            <div className="task-spec-label">Connected {task.account_type === "user" ? "User Account" : "Bot"}</div>
+            <div className="task-spec-value">
+              @{task.bot_username}{" "}
+              <span
+                style={{
+                  background: task.account_type === "user" ? "#7c5cff" : "var(--accent)",
+                  color: "#fff",
+                  fontSize: 10,
+                  fontWeight: 600,
+                  padding: "1px 6px",
+                  borderRadius: 4,
+                }}
+              >
+                {task.account_type === "user" ? "USER" : "BOT"}
+              </span>
+            </div>
           </div>
           <div className="task-spec-item">
             <div className="task-spec-label">Source Chat</div>

@@ -19,6 +19,8 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
       created_at INTEGER NOT NULL DEFAULT (unixepoch())
     )`).run();
 
+    await ensureUserAccountColumns(db);
+
     const existing = await db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
       .first<{ name: string }>();
@@ -43,7 +45,11 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
         label TEXT NOT NULL,
         webhook_secret TEXT NOT NULL,
         created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-        last_update_id INTEGER NOT NULL DEFAULT 0
+        last_update_id INTEGER NOT NULL DEFAULT 0,
+        account_type TEXT NOT NULL DEFAULT 'bot' CHECK (account_type IN ('bot', 'user')),
+        phone TEXT,
+        mtproto_session TEXT,
+        update_state TEXT
       )`),
       db.prepare(`CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
@@ -89,6 +95,7 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
       db.prepare(`CREATE TABLE IF NOT EXISTS saved_tasks (
         id TEXT PRIMARY KEY,
         task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        account_id TEXT,
         bot_token TEXT NOT NULL,
         bot_label TEXT NOT NULL,
         bot_username TEXT NOT NULL,
@@ -135,5 +142,22 @@ export async function ensureDatabaseBootstrap(db: D1Database): Promise<void> {
     bootstrapDone = true;
   } catch (err) {
     console.error("Database bootstrap initialization check failed:", err);
+  }
+}
+
+// Idempotent column upgrades for databases provisioned before user-account support.
+async function ensureUserAccountColumns(db: D1Database): Promise<void> {
+  const botsInfo = (await db.prepare("PRAGMA table_info(bots)").all<{ name: string }>()).results.map((c) => c.name);
+  if (botsInfo.length > 0) {
+    if (!botsInfo.includes("account_type")) {
+      await db.prepare("ALTER TABLE bots ADD COLUMN account_type TEXT NOT NULL DEFAULT 'bot'").run();
+    }
+    if (!botsInfo.includes("phone")) await db.prepare("ALTER TABLE bots ADD COLUMN phone TEXT").run();
+    if (!botsInfo.includes("mtproto_session")) await db.prepare("ALTER TABLE bots ADD COLUMN mtproto_session TEXT").run();
+    if (!botsInfo.includes("update_state")) await db.prepare("ALTER TABLE bots ADD COLUMN update_state TEXT").run();
+  }
+  const savedInfo = (await db.prepare("PRAGMA table_info(saved_tasks)").all<{ name: string }>()).results.map((c) => c.name);
+  if (savedInfo.length > 0 && !savedInfo.includes("account_id")) {
+    await db.prepare("ALTER TABLE saved_tasks ADD COLUMN account_id TEXT").run();
   }
 }

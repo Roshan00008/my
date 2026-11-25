@@ -18,13 +18,40 @@ export type Result<T> =
       retryAfter?: number;
     };
 
+export type AccountType = "bot" | "user";
+
 export interface BotSummary {
   id: string;
   bot_id: number;
   bot_username: string;
   label: string;
   created_at: number;
+  account_type: AccountType;
+  phone?: string | null;
 }
+
+/** Step 1 of user-account login: request an SMS/Telegram code. */
+export interface UserLoginStartRequest {
+  phone: string;
+  label?: string;
+}
+
+export interface UserLoginStartResponse {
+  account_id: string;
+  phone_code_hash: string;
+  phone_code_type: string;
+}
+
+/** Step 2 of user-account login: submit the received code (and 2FA password if enabled). */
+export interface UserLoginSubmitRequest {
+  account_id: string;
+  phone: string;
+  phone_code_hash: string;
+  code: string;
+  password?: string;
+}
+
+export type UserLoginSubmitResponse = Result<BotSummary> & { needs_password?: boolean };
 
 export interface BotWebhookDiagnostics {
   is_active: boolean;
@@ -43,6 +70,8 @@ export interface BotRateLimitDiagnostics {
 
 /** Result of a token check — see handleVerifyBot. */
 export interface BotVerifyResult {
+  account_type: AccountType;
+  phone?: string | null;
   bot_id: number;
   bot_username: string;
   existing_bot_id: string | null;
@@ -53,6 +82,8 @@ export interface BotVerifyResult {
 }
 
 export interface BotInspectionReport {
+  account_type: AccountType;
+  phone?: string | null;
   bot_id: number;
   bot_username: string;
   clone_worker_tasks: {
@@ -112,6 +143,7 @@ export interface TaskSummary {
 
 export interface TaskDetail extends TaskSummary {
   bot_username: string;
+  account_type: AccountType;
 }
 
 export interface CapabilityEntry {
@@ -150,6 +182,7 @@ export interface SourceTaskHistory {
 
 export interface ChatLookupResult {
   chat: { id: number; type: string; title?: string; username?: string };
+  accountType: AccountType;
   botStatus: string;
   capabilities: CapabilityEntry[];
   memberCount?: number;
@@ -162,6 +195,7 @@ export interface ChatLookupResult {
 export interface SavedTaskSummary {
   id: string;
   task_id: string | null;
+  account_id: string | null;
   bot_label: string;
   bot_username: string;
   token_preview: string;

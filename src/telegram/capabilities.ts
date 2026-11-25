@@ -1,7 +1,7 @@
 import type { TelegramChatMember } from "./types";
 import type { CapabilityEntry } from "../shared/rpcTypes";
 
-export function deriveCapabilities(botMember: TelegramChatMember, chatType: string): CapabilityEntry[] {
+export function deriveCapabilities(botMember: TelegramChatMember, chatType: string, accountType: "bot" | "user" = "bot"): CapabilityEntry[] {
   const isCreator = botMember.status === "creator";
   const isAdmin = botMember.status === "administrator" || isCreator;
   const has = (right: keyof TelegramChatMember) => isCreator || (isAdmin && Boolean(botMember[right]));
@@ -10,12 +10,22 @@ export function deriveCapabilities(botMember: TelegramChatMember, chatType: stri
     (botMember.status === "member" || isAdmin) &&
     (chatType !== "channel" || has("can_post_messages"));
 
+  // User accounts copy via forwardMessages, not Bot API copyMessage: protected
+  // content is handled by download+re-upload instead, and invite-link
+  // creation isn't exposed by the minimal MTProto client.
+  const canInvite = accountType === "user" ? false : has("can_invite_users");
+  const canDelete = accountType === "user" ? true : has("can_delete_messages");
+
   return [
     {
       key: "invite_link",
       label: "Generate invite link",
-      available: has("can_invite_users"),
-      reason: has("can_invite_users") ? undefined : "bot lacks the 'Add Users' admin right in this chat",
+      available: canInvite,
+      reason: canInvite
+        ? undefined
+        : accountType === "user"
+          ? "not supported for user accounts in this build"
+          : "bot lacks the 'Add Users' admin right in this chat",
     },
     {
       key: "ban",
@@ -38,8 +48,12 @@ export function deriveCapabilities(botMember: TelegramChatMember, chatType: stri
     {
       key: "delete_message",
       label: "Delete message (used by the 'last N' probe)",
-      available: has("can_delete_messages"),
-      reason: has("can_delete_messages") ? undefined : "bot lacks the 'Delete Messages' admin right in this chat",
+      available: canDelete,
+      reason: canDelete
+        ? accountType === "user"
+          ? "user accounts resolve ranges via getHistory — no probe post needed"
+          : undefined
+        : "bot lacks the 'Delete Messages' admin right in this chat",
     },
   ];
 }

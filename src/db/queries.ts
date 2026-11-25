@@ -18,6 +18,8 @@ export interface BotRow extends BotSummary {
   token: string;
   webhook_secret: string;
   last_update_id: number;
+  mtproto_session: string | null;
+  update_state: string | null;
 }
 
 export async function insertBot(
@@ -26,22 +28,60 @@ export async function insertBot(
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO bots (id, token, bot_id, bot_username, label, webhook_secret, last_update_id) VALUES (?, ?, ?, ?, ?, ?, 0)`,
+      `INSERT INTO bots (id, token, bot_id, bot_username, label, webhook_secret, last_update_id, account_type) VALUES (?, ?, ?, ?, ?, ?, 0, 'bot')`,
     )
     .bind(row.id, row.token, row.bot_id, row.bot_username, row.label, row.webhook_secret)
     .run();
 }
 
+export async function insertUserAccount(
+  db: D1Database,
+  row: { id: string; user_id: number; username: string; label: string; phone: string; webhook_secret: string; mtproto_session: string | null },
+): Promise<void> {
+  // User accounts carry no Bot API token; a placeholder keeps token NOT NULL and
+  // guarantees a user row can never be mistaken for a bot by token lookups.
+  await db
+    .prepare(
+      `INSERT INTO bots (id, token, bot_id, bot_username, label, webhook_secret, last_update_id, account_type, phone, mtproto_session)
+       VALUES (?, ?, ?, ?, ?, ?, 0, 'user', ?, ?)`,
+    )
+    .bind(row.id, `user:${row.id}`, row.user_id, row.username, row.label, row.webhook_secret, row.phone, row.mtproto_session)
+    .run();
+}
+
+export async function updateMtprotoSession(db: D1Database, id: string, sessionJson: string): Promise<void> {
+  await db.prepare(`UPDATE bots SET mtproto_session = ? WHERE id = ?`).bind(sessionJson, id).run();
+}
+
+export async function updateUpdateState(db: D1Database, id: string, stateJson: string): Promise<void> {
+  await db.prepare(`UPDATE bots SET update_state = ? WHERE id = ?`).bind(stateJson, id).run();
+}
+
+export async function updateUserAccountIdentity(db: D1Database, id: string, userId: number, username: string): Promise<void> {
+  await db.prepare(`UPDATE bots SET bot_id = ?, bot_username = ? WHERE id = ?`).bind(userId, username, id).run();
+}
+
+export async function findUserAccountByPhone(db: D1Database, phone: string): Promise<BotRow | null> {
+  const row = await db
+    .prepare(
+      `SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, account_type, phone, mtproto_session, update_state, created_at
+       FROM bots WHERE account_type = 'user' AND phone = ?`,
+    )
+    .bind(phone)
+    .first<BotRow>();
+  return row ?? null;
+}
+
 export async function listBotsSummary(db: D1Database): Promise<BotSummary[]> {
   const { results } = await db
-    .prepare(`SELECT id, bot_id, bot_username, label, created_at FROM bots ORDER BY created_at DESC`)
+    .prepare(`SELECT id, bot_id, bot_username, label, account_type, phone, created_at FROM bots ORDER BY created_at DESC`)
     .all<BotSummary>();
   return results;
 }
 
 export async function listBotsWithSecrets(db: D1Database): Promise<BotRow[]> {
   const { results } = await db
-    .prepare(`SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, created_at FROM bots ORDER BY created_at DESC`)
+    .prepare(`SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, account_type, phone, mtproto_session, update_state, created_at FROM bots ORDER BY created_at DESC`)
     .all<BotRow>();
   return results;
 }
@@ -60,7 +100,7 @@ export async function countActiveLiveTasksForBot(db: D1Database, botId: string, 
 
 export async function getBotWithSecrets(db: D1Database, id: string): Promise<BotRow | null> {
   const row = await db
-    .prepare(`SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, created_at FROM bots WHERE id = ?`)
+    .prepare(`SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, account_type, phone, mtproto_session, update_state, created_at FROM bots WHERE id = ?`)
     .bind(id)
     .first<BotRow>();
   return row ?? null;
@@ -69,7 +109,7 @@ export async function getBotWithSecrets(db: D1Database, id: string): Promise<Bot
 export async function findBotByWebhookSecret(db: D1Database, id: string, secret: string): Promise<BotRow | null> {
   const row = await db
     .prepare(
-      `SELECT id, token, bot_id, bot_username, label, webhook_secret, created_at FROM bots WHERE id = ? AND webhook_secret = ?`,
+      `SELECT id, token, bot_id, bot_username, label, webhook_secret, account_type, phone, created_at FROM bots WHERE id = ? AND webhook_secret = ?`,
     )
     .bind(id, secret)
     .first<BotRow>();
@@ -84,7 +124,7 @@ export async function findBotByTokenOrBotId(
   if (botTelegramId) {
     const row = await db
       .prepare(
-        `SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, created_at FROM bots WHERE token = ? OR bot_id = ?`,
+        `SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, account_type, phone, mtproto_session, update_state, created_at FROM bots WHERE token = ? OR bot_id = ?`,
       )
       .bind(token, botTelegramId)
       .first<BotRow>();
@@ -92,7 +132,7 @@ export async function findBotByTokenOrBotId(
   }
   const row = await db
     .prepare(
-      `SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, created_at FROM bots WHERE token = ?`,
+      `SELECT id, token, bot_id, bot_username, label, webhook_secret, last_update_id, account_type, phone, mtproto_session, update_state, created_at FROM bots WHERE token = ?`,
     )
     .bind(token)
     .first<BotRow>();
@@ -225,6 +265,7 @@ export async function getTaskWithBot(db: D1Database, id: string): Promise<TaskDe
     .prepare(
       `SELECT tasks.*,
               COALESCE(bots.bot_username, 'unknown') as bot_username,
+              COALESCE(bots.account_type, 'bot') as account_type,
               (SELECT COUNT(*) FROM task_pending_messages WHERE task_id = tasks.id) as pending_count
        FROM tasks
        LEFT JOIN bots ON bots.id = tasks.bot_id
@@ -236,6 +277,7 @@ export async function getTaskWithBot(db: D1Database, id: string): Promise<TaskDe
   return {
     ...rowToTask(row),
     bot_username: (row.bot_username as string) ?? "unknown",
+    account_type: (row.account_type as "bot" | "user") ?? "bot",
   };
 }
 
@@ -751,6 +793,7 @@ export async function insertUpdate(db: D1Database, botId: string, updateId: numb
 export interface NewSavedTask {
   id: string;
   task_id: string | null;
+  account_id: string | null;
   bot_token: string;
   bot_label: string;
   bot_username: string;
@@ -773,15 +816,16 @@ export async function insertSavedTask(db: D1Database, t: NewSavedTask): Promise<
   await db
     .prepare(
       `INSERT INTO saved_tasks (
-        id, task_id, bot_token, bot_label, bot_username,
+        id, task_id, account_id, bot_token, bot_label, bot_username,
         source_chat_id, source_chat_title, dest_chat_id, dest_chat_title,
         scope, backfill_mode, start_id, end_id, n, pacing_batch_size,
         filter_media_types, filter_min_size_bytes, filter_max_size_bytes
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
     .bind(
       t.id,
       t.task_id,
+      t.account_id,
       t.bot_token,
       t.bot_label,
       t.bot_username,
@@ -805,7 +849,7 @@ export async function insertSavedTask(db: D1Database, t: NewSavedTask): Promise<
 export async function listSavedTasks(db: D1Database): Promise<SavedTaskSummary[]> {
   const { results } = await db
     .prepare(
-      `SELECT id, task_id, bot_label, bot_username,
+      `SELECT id, task_id, account_id, bot_label, bot_username,
               substr(bot_token, 1, 6) || '…' || substr(bot_token, -4) AS token_preview,
               source_chat_id, source_chat_title, dest_chat_id, dest_chat_title,
               scope, backfill_mode, start_id, end_id, n, pacing_batch_size,
@@ -820,7 +864,7 @@ export async function listSavedTasks(db: D1Database): Promise<SavedTaskSummary[]
 export async function getSavedTask(db: D1Database, id: string): Promise<SavedTaskWithToken | null> {
   const row = await db
     .prepare(
-      `SELECT id, task_id, bot_token, bot_label, bot_username,
+      `SELECT id, task_id, account_id, bot_token, bot_label, bot_username,
               substr(bot_token, 1, 6) || '…' || substr(bot_token, -4) AS token_preview,
               source_chat_id, source_chat_title, dest_chat_id, dest_chat_title,
               scope, backfill_mode, start_id, end_id, n, pacing_batch_size,

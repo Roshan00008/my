@@ -77,6 +77,15 @@ Whether you need to migrate an archive of 100,000+ historical media files, maint
 - **Responsive Layout**: Docked bottom footer on desktop/tablet views and touch-friendly mobile drawer.
 - **Fail-Safe Error Boundary**: React crashes are caught gracefully with intuitive recovery actions instead of blank screens.
 
+### 👤 User Accounts (MTProto Userbots)
+- **Log in with a real Telegram user account** (phone → code → optional 2FA) right from the "Connected Accounts" page — no BotFather token needed.
+- **Full MTProto stack built in**: hand-rolled TL codec, AES-256-IGE/CTR, RSA_PAD auth-key handshake, SRP-6a 2FA, obfuscated2 WebSocket transport. No third-party MTProto dependency.
+- **Why user accounts**: bots cannot copy *protected-content* messages at all, and are limited in groups. A user account forwards via `messages.forwardMessages` and, for protected content (`FORWARDS_RESTRICTED`), transparently falls back to **download + re-upload**, copying what bots can't.
+- **Live sync for users**: instead of `getUpdates`, the cron tick polls `messages.getHistory` per task with a persisted per-chat watermark (`bots.update_state`), so nothing is missed or double-copied across isolate restarts.
+- **Separate pacing**: user accounts default to 20 messages/batch (vs 60 for bots) to stay under Telegram's behavioral flood limits; `FLOOD_WAIT`/`PEER_FLOOD` map onto the existing rate-limit cooldown machinery.
+- **Setup**: create an app at [my.telegram.org](https://my.telegram.org), then `wrangler secret put TG_API_ID` and `wrangler secret put TG_API_HASH`.
+- **Limitations**: invite-link creation is not supported for user accounts in this build; range discovery uses `getHistory` instead of a probe message, so nothing is ever posted into the source chat.
+
 ### 🔐 Optional Admin Security & Authentication
 - **Zero-Friction Master Password**: Protect your web console by defining an optional `ADMIN_PASSWORD` secret in Cloudflare or setting one via the browser on first launch.
 - **Open Access Mode**: If you prefer an open console, simply tap "Proceed without password". You can secure it at any time directly from the console navigation.

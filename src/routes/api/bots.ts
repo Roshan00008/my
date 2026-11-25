@@ -1,5 +1,7 @@
 import { TelegramClient } from "../../telegram/client";
 import { TelegramApiError, toResult, type Result } from "../../telegram/errors";
+import { BotAccountClient, createAccountClient, type AccountClient } from "../../telegram/account";
+import type { BotRow } from "../../db/queries";
 import {
   deleteBot,
   findBotByTokenOrBotId,
@@ -23,6 +25,13 @@ function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 }
 
+/** Resolve a botId to the right account client (bot token or MTProto user). */
+async function loadAccountById(env: Env, botId: string): Promise<{ row: BotRow; client: AccountClient } | null> {
+  const row = await getBotWithSecrets(env.DB, botId);
+  if (!row) return null;
+  return { row, client: createAccountClient(env, row) };
+}
+
 export async function handleListBots(env: Env): Promise<Response> {
   const bots = await listBotsSummary(env.DB);
   return json({ ok: true, data: bots });
@@ -34,9 +43,15 @@ export async function handleListBots(env: Env): Promise<Response> {
 export async function handleSyncWebhooks(request: Request, env: Env): Promise<Response> {
   const bots = await listBotsWithSecrets(env.DB);
   let webhooksDeleted = 0;
+  let userAccountsSkipped = 0;
   const errors: string[] = [];
 
   for (const bot of bots) {
+    if (bot.account_type === "user") {
+      // User accounts have no Bot API webhook to clean up.
+      userAccountsSkipped++;
+      continue;
+    }
     const client = new TelegramClient(bot.token);
     try {
       await client.deleteWebhook(false);
@@ -51,6 +66,7 @@ export async function handleSyncWebhooks(request: Request, env: Env): Promise<Re
     data: {
       totalBots: bots.length,
       webhooksDeleted,
+      userAccountsSkipped,
       errors: errors.length > 0 ? errors : undefined,
     },
   });
@@ -62,19 +78,20 @@ export async function handleVerifyBot(request: Request, env: Env): Promise<Respo
   const body = (await request.json().catch(() => ({}))) as { token?: string; botId?: string };
   let token = body.token?.trim();
   let existingBotId: string | null = null;
+  let account: { row: BotRow; client: AccountClient } | null = null;
 
   if (!token && body.botId) {
-    const saved = await getBotWithSecrets(env.DB, body.botId);
-    if (!saved) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
-    token = saved.token;
-    existingBotId = saved.id;
+    account = await loadAccountById(env, body.botId);
+    if (!account) return json({ ok: false, errorCode: 404, description: "account not found", reason: "invalid_request" }, 404);
+    token = account.row.token;
+    existingBotId = account.row.id;
   }
 
   if (!token) {
     return json({ ok: false, errorCode: 0, description: "token or botId is required", reason: "invalid_request" }, 400);
   }
 
-  const client = new TelegramClient(token);
+  const client: AccountClient = account?.client ?? new BotAccountClient(new TelegramClient(token));
   const result: Result<BotVerifyResult> = await toResult(async () => {
     const [me, webhookInfo] = await Promise.all([
       client.getMe(),
@@ -105,6 +122,8 @@ export async function handleVerifyBot(request: Request, env: Env): Promise<Respo
     }
 
     return {
+      account_type: existing?.account_type ?? "bot",
+      phone: existing?.phone ?? null,
       bot_id: me.id,
       bot_username: me.username ?? me.first_name,
       existing_bot_id: existingBotId,
@@ -130,19 +149,20 @@ export async function handleInspectBot(request: Request, env: Env): Promise<Resp
   const body = (await request.json().catch(() => ({}))) as { token?: string; botId?: string };
   let token = body.token?.trim();
   let existingBotId: string | null = null;
+  let account: { row: BotRow; client: AccountClient } | null = null;
 
   if (!token && body.botId) {
-    const saved = await getBotWithSecrets(env.DB, body.botId);
-    if (!saved) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
-    token = saved.token;
-    existingBotId = saved.id;
+    account = await loadAccountById(env, body.botId);
+    if (!account) return json({ ok: false, errorCode: 404, description: "account not found", reason: "invalid_request" }, 404);
+    token = account.row.token;
+    existingBotId = account.row.id;
   }
 
   if (!token) {
     return json({ ok: false, errorCode: 0, description: "token or botId is required", reason: "invalid_request" }, 400);
   }
 
-  const client = new TelegramClient(token);
+  const client: AccountClient = account?.client ?? new BotAccountClient(new TelegramClient(token));
   const result: Result<BotInspectionReport> = await toResult(async () => {
     const me = await client.getMe();
     const webhookInfo = await client.getWebhookInfo().catch(() => null);
@@ -174,7 +194,7 @@ export async function handleInspectBot(request: Request, env: Env): Promise<Resp
     const isWebhookActive = Boolean(webhookInfo?.url);
 
     // If no webhook is active, probe getUpdates for pending messages or polling conflicts
-    if (!isWebhookActive) {
+    if (!isWebhookActive && client.kind === "bot") {
       try {
         const rawUpdates = await client.getUpdates({ limit: 8 });
         if (rawUpdates && rawUpdates.length > 0) {
@@ -189,6 +209,8 @@ export async function handleInspectBot(request: Request, env: Env): Promise<Resp
     }
 
     return {
+      account_type: existing?.account_type ?? "bot",
+      phone: existing?.phone ?? null,
       bot_id: me.id,
       bot_username: me.username ?? me.first_name,
       clone_worker_tasks: {
@@ -219,15 +241,21 @@ export async function handleInspectBot(request: Request, env: Env): Promise<Resp
 export async function handleDisconnectBotWebhook(request: Request, env: Env): Promise<Response> {
   const body = (await request.json().catch(() => ({}))) as { token?: string; botId?: string };
   let token = body.token?.trim();
+  let account: { row: BotRow; client: AccountClient } | null = null;
 
   if (!token && body.botId) {
-    const saved = await getBotWithSecrets(env.DB, body.botId);
-    if (!saved) return json({ ok: false, errorCode: 404, description: "bot not found", reason: "invalid_request" }, 404);
-    token = saved.token;
+    account = await loadAccountById(env, body.botId);
+    if (!account) return json({ ok: false, errorCode: 404, description: "account not found", reason: "invalid_request" }, 404);
+    token = account.row.token;
   }
 
   if (!token) {
     return json({ ok: false, errorCode: 0, description: "token or botId is required", reason: "invalid_request" }, 400);
+  }
+
+  // User accounts have no webhook — nothing to disconnect.
+  if (account && account.row.account_type === "user") {
+    return json({ ok: true, data: { disconnected: true, pending_updates_preserved: true, pending_update_count: 0, note: "user account: no webhook exists" } });
   }
 
   const client = new TelegramClient(token);
@@ -264,7 +292,7 @@ export async function createBotRecord(env: Env, _origin: string, token: string, 
       label: botLabel,
       webhook_secret: webhookSecret,
     });
-    return { id, bot_id: me.id, bot_username: botUsername, label: botLabel, created_at: Math.floor(Date.now() / 1000) };
+    return { id, bot_id: me.id, bot_username: botUsername, label: botLabel, account_type: "bot" as const, created_at: Math.floor(Date.now() / 1000) };
   });
 }
 
