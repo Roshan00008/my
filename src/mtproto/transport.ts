@@ -1,57 +1,55 @@
+import { connect } from "cloudflare:sockets";
 import { AesCtr, aesIgeDecrypt, aesIgeEncrypt } from "./aes";
 import { concat, randomBytes, reverse, xor } from "./bytes";
-import { sha256 } from "./hash";
 
-// WebSocket (WSS) endpoint names per DC. Media/CDN DCs use the same hosts.
-const DC_HOSTS: Record<number, string> = {
-  1: "pluto",
-  2: "venus",
-  3: "aurora",
-  4: "vesta",
-  5: "flora",
+// DC front-end IPs, port 443 serves raw MTProto (same table Telethon uses).
+export const DC_IPS: Record<number, string> = {
+  1: "149.154.175.50",
+  2: "149.154.167.51",
+  3: "149.154.175.100",
+  4: "149.154.167.91",
+  5: "149.154.171.5",
 };
 
+type SocketsSocket = Awaited<ReturnType<typeof connect>>;
+
 export function dcHost(dcId: number): string {
-  const name = DC_HOSTS[Math.abs(dcId)];
-  if (!name) throw new Error(`unknown DC ${dcId}`);
-  return name;
+  const ip = DC_IPS[Math.abs(dcId)];
+  if (!ip) throw new Error(`unknown DC ${dcId}`);
+  return ip;
 }
 
-// Fixed obfuscation "secret" used by Telegram web clients (obfuscated2 over WSS).
-const OBF_SECRET = new Uint8Array(16).fill(0x99);
-
 /**
- * Obfuscated abridged MTProto transport over a Workers outbound WebSocket.
- * The WS connection is opened via fetch with an Upgrade header (workerd
- * supports custom headers + Sec-WebSocket-Protocol this way).
+ * Obfuscated abridged MTProto over a raw TCP socket (cloudflare:sockets).
+ *
+ * Standard obfuscated2 exactly as Telethon's ConnectionTcpObfuscated:
+ *   init:  64 random bytes, first 56 plaintext (with forbidden prefixes),
+ *          bytes 56..59 = 0xefefefef (abridged tag), bytes 56..64 AES-CTR
+ *          encrypted tail.
+ *   keys:  encrypt = init[8..40] / init[40..56], decrypt = first 32/16 bytes
+ *          of reversed init[8..56]. RAW bytes — no hashing, no secret.
+ * The encryptor keystream continues past the init; the decryptor starts at
+ * keystream offset 0. Abridged framing carries the MTProto payloads.
  */
 export class ObfuscatedWsTransport {
-  private ws: WebSocket | null = null;
+  private socket: SocketsSocket | null = null;
   private encCtr: AesCtr | null = null;
   private decCtr: AesCtr | null = null;
   private recvBuf = new Uint8Array(0);
   private closed = false;
+  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
   async connect(dcId: number): Promise<void> {
-    const host = dcHost(dcId);
-    const url = `https://${host}.web.telegram.org/apiws`;
-    const res = await fetch(url, {
-      headers: {
-        Upgrade: "websocket",
-        Connection: "Upgrade",
-        Origin: "https://web.telegram.org",
-        "Sec-WebSocket-Protocol": "binary",
-      },
-    });
-    if (res.status !== 101 || !res.webSocket) {
-      throw new Error(`WS handshake to ${url} failed: HTTP ${res.status}`);
+    const ip = dcHost(dcId);
+    const socket = connect({ hostname: ip, port: 443 });
+    await socket.opened;
+    if (this.closed) {
+      socket.close();
+      return;
     }
-    const ws = res.webSocket;
-    ws.accept();
-    ws.binaryType = "arraybuffer";
-    this.ws = ws;
+    this.socket = socket;
 
-    // Build the 64-byte obfuscated init payload (abridged protocol 0xef).
+    // Build the 64-byte obfuscated init (abridged protocol 0xef).
     let init: Uint8Array;
     for (;;) {
       init = randomBytes(64);
@@ -62,38 +60,40 @@ export class ObfuscatedWsTransport {
         firstInt === 0xeeeeeeee ||
         firstInt === 0x44414548 || // HEAD
         firstInt === 0x54534f50 || // POST
-        firstInt === 0x20544547 || // "GET "
+        firstInt === 0x20544547 || // GET
         firstInt === 0x4954504f || // OPTI
-        firstInt === 0x02010316 ||
+        firstInt === 0x47525650 || // PVrG
+        firstInt === 0x02010316 || // TLS
         (init[4] | (init[5] << 8) | (init[6] << 16) | (init[7] << 24)) === 0
       ) {
         continue;
       }
       break;
     }
-    // protocol id at offset 56, padded with itself to 4 bytes: 0xef -> 0xefefefef
-    init[56] = 0xef;
-    init[57] = 0xef;
-    init[58] = 0xef;
-    init[59] = 0xef;
 
-    const initRev = reverse(init);
-    const encKey = await sha256(concat(init.subarray(8, 40), OBF_SECRET));
-    const decKey = await sha256(concat(initRev.subarray(8, 40), OBF_SECRET));
-    const encIv = init.subarray(40, 56);
-    const decIv = initRev.subarray(40, 56);
+    // Standard obfuscated2 key derivation — raw bytes, no hashing, no secret:
+    //   encrypt: key = init[8..40], iv = init[40..56]
+    //   decrypt: key/iv = first 32/16 bytes of reversed(init[8..56])
+    const initRev = reverse(init.subarray(8, 56));
+    this.encCtr = new AesCtr(init.subarray(8, 40), init.subarray(40, 56));
+    this.decCtr = new AesCtr(initRev.subarray(0, 32), initRev.subarray(32, 48));
 
-    this.encCtr = new AesCtr(encKey, encIv);
-    this.decCtr = new AesCtr(decKey, decIv);
-
+    // Encrypt the init tail (keystream bytes 56..64); the CTR stream then
+    // continues past offset 64 for all later payloads.
     const encryptedInit = this.encCtr.crypt(init);
     const finalInit = concat(init.subarray(0, 56), encryptedInit.subarray(56, 64));
-    this.sendRaw(finalInit);
+
+    const writer = this.socket.writable.getWriter();
+    await writer.write(finalInit);
+    writer.releaseLock();
+    this.reader = this.socket.readable.getReader();
   }
 
   private sendRaw(data: Uint8Array): void {
-    if (!this.ws) throw new Error("transport not connected");
-    this.ws.send(data);
+    if (!this.socket) throw new Error("transport not connected");
+    const writer = this.socket.writable.getWriter();
+    void writer.write(data);
+    writer.releaseLock();
   }
 
   /** Sends one abridged-framed MTProto payload, CTR-obfuscated. */
@@ -111,49 +111,49 @@ export class ObfuscatedWsTransport {
 
   /** Reads exactly one abridged-framed MTProto payload (deobfuscated). */
   async recv(timeoutMs = 30000): Promise<Uint8Array> {
-    if (!this.decCtr || !this.ws) throw new Error("transport not initialized");
+    if (!this.decCtr || !this.socket) throw new Error("transport not initialized");
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const frame = this.tryParseFrame();
       if (frame) return frame;
       if (this.closed) throw new Error("transport closed");
-      if (Date.now() > deadline) throw new Error("transport read timeout");
+      if (Date.now() > deadline) throw new Error(`transport read timeout (recvBuf=${this.recvBuf.length} closed=${this.closed})`);
       await this.waitMessage(deadline - Date.now());
     }
   }
 
   private waitMessage(ms: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      const ws = this.ws!;
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("transport read timeout"));
-      }, Math.max(ms, 1));
-      const onMsg = (ev: MessageEvent) => {
-        cleanup();
-        const data = ev.data;
-        const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data as ArrayBuffer);
-        this.recvBuf = concat(this.recvBuf, this.decCtr!.crypt(bytes));
-        resolve();
-      };
-      const onClose = () => {
-        cleanup();
-        this.closed = true;
-        reject(new Error("transport closed by peer"));
-      };
-      const onErr = () => {
-        cleanup();
-        reject(new Error("transport error"));
-      };
+      const reader = this.reader;
+      if (!reader) {
+        reject(new Error("transport not initialized"));
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout>;
       const cleanup = () => {
         clearTimeout(timer);
-        ws.removeEventListener("message", onMsg);
-        ws.removeEventListener("close", onClose);
-        ws.removeEventListener("error", onErr);
       };
-      ws.addEventListener("message", onMsg);
-      ws.addEventListener("close", onClose);
-      ws.addEventListener("error", onErr);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`transport read timeout (recvBuf=${this.recvBuf.length} closed=${this.closed})`))
+      }, Math.max(ms, 1));
+      reader
+        .read()
+        .then((res) => {
+          cleanup();
+          if (res.done) {
+            this.closed = true;
+            reject(new Error("transport closed by peer"));
+            return;
+          }
+          this.recvBuf = concat(this.recvBuf, this.decCtr!.crypt(res.value));
+          resolve();
+        })
+        .catch(() => {
+          cleanup();
+          this.closed = true;
+          reject(new Error("transport closed by peer"));
+        });
     });
   }
 
@@ -191,11 +191,12 @@ export class ObfuscatedWsTransport {
   close(): void {
     this.closed = true;
     try {
-      this.ws?.close();
+      this.reader?.cancel().catch(() => undefined);
+      this.socket?.close();
     } catch {
       // ignore
     }
-    this.ws = null;
+    this.socket = null;
   }
 }
 

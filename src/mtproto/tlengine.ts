@@ -22,6 +22,7 @@ export type Kind =
   | "int128"
   | "int256"
   | "true"
+  | "raw" // bare !X: pre-serialized bytes written as-is (wrapper query fields)
   | { vec: Kind }
   | { obj: string };
 
@@ -64,6 +65,7 @@ export function parseKind(k: Kind, r: TLReader, flags: number, flags2: number): 
       case "bool": return r.bool();
       case "int128": return r.int128();
       case "int256": return r.int256();
+      case "raw": throw new Error("raw kind is write-only (wrapper query)");
       case "true": return true;
     }
   }
@@ -118,6 +120,7 @@ export function writeKind(k: Kind, w: TLWriter, v: unknown): void {
       case "int128": w.int128(v as Uint8Array); return;
       case "int256": w.int256(v as Uint8Array); return;
       case "true": w.ctor(0x997275b5); return;
+      case "raw": w.object(v as Uint8Array); return; // object() pushes bytes verbatim
     }
   }
   if ("vec" in k) {

@@ -28,7 +28,7 @@ def("Handshake", "dh_gen_retry", 0x46dc1fb9, [F("nonce", "int128"), F("server_no
 def("Handshake", "dh_gen_fail", 0xa69dae02, [F("nonce", "int128"), F("server_nonce", "int128"), F("new_nonce_hash3", "int128")]);
 
 // ---------- wrapping ----------
-def("Wrapper", "invokeWithLayer", 0xda9b0d0d, [F("layer", "int"), F("query", obj("Object"))]);
+def("Wrapper", "invokeWithLayer", 0xda9b0d0d, [F("layer", "int"), F("query", "raw")]);
 def("Wrapper", "initConnection", 0xc1cd5ea9, [
   F("flags", "int"),
   F("api_id", "int"),
@@ -38,6 +38,7 @@ def("Wrapper", "initConnection", 0xc1cd5ea9, [
   F("system_lang_code", "string"),
   F("lang_pack", "string"),
   F("lang_code", "string"),
+  F("query", "raw"),
 ]);
 
 // ---------- auth ----------

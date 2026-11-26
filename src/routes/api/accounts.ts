@@ -1,8 +1,11 @@
 // User-account (MTProto) login flow:
 //   POST /api/accounts/user/start   { phone, label? }  -> sends login code, returns phone_code_hash
 //   POST /api/accounts/user/submit  { account_id, phone, phone_code_hash, code, password? } -> signs in
+//   POST /api/accounts/user/session { session_string, label? } -> imports a Telethon StringSession directly
 import { MtprotoClient } from "../../mtproto/api";
 import { TelegramApiError } from "../../telegram/errors";
+import { hex } from "../../mtproto/bytes";
+import { sha1 } from "../../mtproto/hash";
 import {
   findUserAccountByPhone,
   getBotWithSecrets,
@@ -16,6 +19,7 @@ import type {
   UserLoginStartResponse,
   UserLoginSubmitRequest,
   UserLoginSubmitResponse,
+  UserSessionImportRequest,
 } from "../../shared/rpcTypes";
 
 function json(data: unknown, status = 200): Response {
@@ -146,6 +150,108 @@ export async function handleUserLoginSubmit(request: Request, env: Env): Promise
     } finally {
       client.close();
     }
+  } catch (e) {
+    const desc = e instanceof Error ? e.message : String(e);
+    return json({ ok: false, errorCode: 500, description: desc, reason: "unknown" }, 500);
+  }
+}
+
+function b64UrlDecode(s: string): Uint8Array {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Parses a Telethon StringSession: '1' + base64url( dc_id:1 | ip:4|16 | port:2 | auth_key:256 ).
+ * Returns the DC id and the raw 256-byte auth key.
+ */
+export function parseSessionString(sessionString: string): { dcId: number; authKey: Uint8Array } {
+  const s = sessionString.trim();
+  if (!s.startsWith("1")) throw new Error("not a Telethon-style session string (must start with '1')");
+  const raw = b64UrlDecode(s.slice(1));
+  const ipLen = raw.length === 263 ? 4 : raw.length === 275 ? 16 : 0;
+  if (!ipLen) throw new Error(`unexpected session payload length ${raw.length} (expected 263 for IPv4 or 275 for IPv6)`);
+  let dcId = raw[0];
+  if (dcId > 127) dcId -= 256; // media-only DCs are encoded as negative bytes
+  const authKey = raw.subarray(raw.length - 256);
+  if (authKey.every((b) => b === 0)) throw new Error("session string contains an empty auth key");
+  return { dcId, authKey };
+}
+
+export async function handleUserSessionImport(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = (await request.json()) as UserSessionImportRequest;
+    let parsed: { dcId: number; authKey: Uint8Array };
+    try {
+      parsed = parseSessionString(body.session_string ?? "");
+    } catch (e) {
+      const desc = e instanceof Error ? e.message : String(e);
+      return json({ ok: false, errorCode: 400, description: desc, reason: "invalid_request" }, 400);
+    }
+    const dcId = Math.abs(parsed.dcId);
+    const authKeyId = (await sha1(parsed.authKey)).slice(-8);
+    const store = {
+      primaryDc: dcId,
+      dcs: {
+        [String(dcId)]: {
+          dcId,
+          authKey: hex(parsed.authKey),
+          authKeyId: hex(authKeyId),
+          serverSalt: "0000000000000000", // updated by the server on first RPC response
+        },
+      },
+    };
+    const id = crypto.randomUUID();
+    const label = (body.label ?? "").trim() || `user@dc${dcId}`;
+    await insertUserAccount(env.DB, {
+      id,
+      user_id: 0,
+      username: "",
+      label,
+      phone: "",
+      webhook_secret: randomSecret(),
+      mtproto_session: JSON.stringify(store),
+    });
+
+    // Best-effort identity resolution over MTProto; the account is usable even
+    // if this fails (transport issues) — identity fills in on first successful sync.
+    let userId = 0;
+    let username = "";
+    try {
+      const { apiId, apiHash } = apiCreds(env);
+      const client = new MtprotoClient({
+        apiId,
+        apiHash,
+        sessionJson: JSON.stringify(store),
+        onSessionPersist: (s) => updateMtprotoSession(env.DB, id, s),
+      });
+      try {
+        const me = await client.getMe();
+        userId = me.id;
+        username = me.username ?? "";
+        await updateUserAccountIdentity(env.DB, id, userId, username);
+      } finally {
+        client.close();
+      }
+    } catch {
+      // ignore — session is stored, identity resolves later
+    }
+
+    const row = await getBotWithSecrets(env.DB, id);
+    const summary: BotSummary = {
+      id,
+      bot_id: userId,
+      bot_username: username,
+      label,
+      account_type: "user",
+      phone: null,
+      created_at: row?.created_at ?? 0,
+    };
+    return json({ ok: true, data: summary }, 200);
   } catch (e) {
     const desc = e instanceof Error ? e.message : String(e);
     return json({ ok: false, errorCode: 500, description: desc, reason: "unknown" }, 500);

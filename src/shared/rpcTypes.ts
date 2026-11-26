@@ -53,6 +53,14 @@ export interface UserLoginSubmitRequest {
 
 export type UserLoginSubmitResponse = Result<BotSummary> & { needs_password?: boolean };
 
+/** Direct import of a Telethon StringSession — skips the phone/code login entirely. */
+export interface UserSessionImportRequest {
+  session_string: string;
+  label?: string;
+}
+
+export type UserSessionImportResponse = Result<BotSummary>;
+
 export interface BotWebhookDiagnostics {
   is_active: boolean;
   url?: string;

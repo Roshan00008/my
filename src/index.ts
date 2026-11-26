@@ -34,7 +34,7 @@ import {
   handleGetSavedTask,
   handleListSavedTasks,
 } from "./routes/api/savedTasks";
-import { handleUserLoginStart, handleUserLoginSubmit } from "./routes/api/accounts";
+import { handleUserLoginStart, handleUserLoginSubmit, handleUserSessionImport } from "./routes/api/accounts";
 import { runTick } from "./jobs/tick";
 import { ensureDatabaseBootstrap } from "./db/bootstrap";
 import {
@@ -91,6 +91,7 @@ export default {
       if (parts[1] === "accounts" && parts[2] === "user" && parts.length === 4) {
         if (parts[3] === "start" && request.method === "POST") return handleUserLoginStart(request, env);
         if (parts[3] === "submit" && request.method === "POST") return handleUserLoginSubmit(request, env);
+        if (parts[3] === "session" && request.method === "POST") return handleUserSessionImport(request, env);
       }
 
       // /api/bots
